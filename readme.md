@@ -159,3 +159,9 @@ This solution reduces costs by >80% while maintaining data accessibility and req
 
 ![deepseek_mermaid_20250623_dceee7](https://github.com/user-attachments/assets/1509e709-b4e6-4338-8458-3ac629d414c7)
 
+
+Prompts Used:
+
+prompt 1: act as a devops engineer and go through the below senario and provide best solution to implement.
+prompt 2: Act as Devops engineer and need to provide cost optimization solution.
+
