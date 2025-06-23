@@ -24,51 +24,77 @@ az storage account create \
 Function Logic (Pseudocode):
 
 python
-import azure.functions as func
-import datetime
-from azure.storage.blob import BlobServiceClient
-from azure.cosmos import CosmosClient
+  import datetime
+  import json
+  import os
+  from azure.storage.blob import BlobServiceClient
+  from azure.cosmos import CosmosClient
 
-def main(timer: func.TimerRequest) -> None:
+  def main(timer: func.TimerRequest) -> None:
     # Initialize clients
-    cosmos_client = CosmosClient(COSMOS_URI, COSMOS_KEY)
-    blob_client = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
-    container_client = blob_client.get_container_client("billing-records")
+    cosmos_client = CosmosClient(os.environ['COSMOS_URI'], os.environ['COSMOS_KEY'])
+    blob_client = BlobServiceClient.from_connection_string(os.environ['BLOB_CONN_STR'])
+    container = blob_client.get_container_client("billing-records")
+    cosmos_container = cosmos_client.get_database_client("billing-db").get_container_client("billing")
 
-    # Calculate cutoff date (3 months ago)
-    cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=90)
-
-    # Query old records from Cosmos DB
-    query = f"SELECT * FROM c WHERE c.timestamp < '{cutoff_date.isoformat()}'"
-    items = cosmos_client.query_items(query, enable_cross_partition_query=True)
+    # Calculate cutoff (3 months ago)
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=90)
+    
+    # Query for old records
+    query = "SELECT * FROM c WHERE c.lastAccessDate < @cutoff"
+    params = [{"name": "@cutoff", "value": cutoff.isoformat()}]
+    records = cosmos_container.query_items(query=query, parameters=params, enable_cross_partition_query=True)
 
     # Archive each record
-    for item in items:
-        blob_name = f"{item['id']}.json"
-        blob_client = container_client.get_blob_client(blob_name)
-        
-        # Upload to Blob Storage
-        blob_client.upload_blob(json.dumps(item))
-        
-        # Delete from Cosmos DB after successful upload
-        cosmos_client.delete_item(item['id'], item['id'])
+    for record in records:
+        try:
+            # Create blob name
+            blob_name = f"{record['id']}.json"
+            
+            # Upload to blob storage
+            blob_client = container.get_blob_client(blob_name)
+            blob_client.upload_blob(json.dumps(record), overwrite=True)
+            
+            # Verify upload
+            if blob_client.exists():
+                # Delete from Cosmos DB
+                cosmos_container.delete_item(item=record['id'], partition_key=record['id'])
+                logging.info(f"Archived record {record['id']}")
+        except Exception as e:
+            logging.error(f"Failed to archive {record['id']}: {str(e)}")
+            # Implement retry logic here
 3. Modified Read API (Transparent Retrieval)
-python
-def get_billing_record(record_id):
+  python
+      def get_billing_record(record_id: str):
     # 1. Try Cosmos DB (Hot Tier)
     try:
-        record = cosmos_container.read_item(record_id, record_id)
+        record = cosmos_container.read_item(item=record_id, partition_key=record_id)
+        
+        # Update access time (optional)
+        record['lastAccessDate'] = datetime.datetime.utcnow().isoformat()
+        cosmos_container.upsert_item(record)
         return record
-    except CosmosResourceNotFoundError:
-        pass
+    except exceptions.CosmosResourceNotFoundError:
+        pass  # Proceed to cold storage
 
-    # 2. Fallback to Blob Storage (Cold Tier)
-    blob_client = blob_container.get_blob_client(f"{record_id}.json")
+    # 2. Try Blob Storage (Cold Tier)
+    blob_client = container.get_blob_client(f"{record_id}.json")
     if blob_client.exists():
-        data = blob_client.download_blob().readall()
-        return json.loads(data)
-    else:
-        raise RecordNotFoundError
+        try:
+            # Download and parse
+            data = blob_client.download_blob().readall()
+            record = json.loads(data)
+            
+            # Optional: Warm read by restoring to Cosmos
+            if record.get('restoreOnAccess'):
+                cosmos_container.upsert_item(record)
+            return record
+        except Exception as e:
+            raise StorageError(f"Cold storage read failed: {str(e)}")
+    
+    # 3. Record not found
+    raise RecordNotFoundError(f"Record {record_id} not found")
+   
 Key Components & Cost Optimization
 Component	Cost Savings Mechanism	Implementation Notes
 Azure Blob Storage (Cool)	~68% cheaper storage vs. Cosmos DB	$0.01/GB/month vs $0.03/GB/month (Cosmos DB)
@@ -130,3 +156,6 @@ Alerts: Monitor function failures with Application Insights
 Point-in-Time Restore: Enable on Cosmos DB for rollback
 
 This solution reduces costs by >80% while maintaining data accessibility and requiring no API changes. The serverless architecture ensures minimal operational overhead.
+
+![deepseek_mermaid_20250623_dceee7](https://github.com/user-attachments/assets/1509e709-b4e6-4338-8458-3ac629d414c7)
+
